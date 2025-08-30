@@ -2,47 +2,44 @@ import os
 import sys
 import requests
 import subprocess
+import time
+import socket
 from packaging import tags
 from packaging.version import parse as parse_version
 from packaging.tags import Tag
 from packaging.requirements import Requirement
 from packaging.markers import default_environment
-from pypdl import Pypdl
+from importlib.metadata import distributions
+
+def is_aria2_running():
+    try:
+        with socket.create_connection(("localhost", 6800), timeout=2):
+            return True
+    except:
+        return False
 
 def installed_list():
-    """Returns a dictionary of installed packages and their versions."""
-    try:
-        command_output = subprocess.check_output(f'"{sys.executable}" -m pip list --format=freeze', shell=True)
-        out = command_output.decode().splitlines()
-        installed = {line.split('==')[0].lower(): line.split('==')[1] for line in out if '==' in line}
-        return installed
-    except subprocess.CalledProcessError as e:
-        print(f"Failed to get installed packages: {e}")
-        return {}
+    installed = {}
+    for dist in distributions():
+        installed[dist.metadata['Name'].lower()] = dist.version
+    return installed
 
 def get_compatible_tags():
-    """Gets the set of tags compatible with the current system."""
     return set(tags.sys_tags())
 
 def parse_wheel_tags(filename):
-    """Parses PEP 425 tags from a wheel filename."""
-    try:
-        parts = filename.rstrip('.whl').split('-')
-        if len(parts) < 4:
-            return []
-        python_tag, abi_tag, platform_tag = parts[-3:]
-        pythons = python_tag.split('.')
-        abis = abi_tag.split('.')
-        platforms = platform_tag.split('.')
-        return [Tag(p, a, pl) for p in pythons for a in abis for pl in platforms]
-    except ValueError:
+    if filename.endswith('.whl'):
+        filename = filename[:-4]
+    parts = filename.split('-')
+    if len(parts) < 4:
         return []
+    python_tag, abi_tag, platform_tag = parts[-3:]
+    pythons = python_tag.split('.')
+    abis = abi_tag.split('.')
+    platforms = platform_tag.split('.')
+    return [Tag(p, a, pl) for p in pythons for a in abis for pl in platforms]
 
 def get_best_wheel(package_name):
-    """
-    Finds the best compatible wheel from PyPI.
-    Returns the URL, filename, and the specific version string found.
-    """
     url = f"https://pypi.org/pypi/{package_name}/json"
     try:
         response = requests.get(url, timeout=10)
@@ -67,17 +64,11 @@ def get_best_wheel(package_name):
             if file_info.get('packagetype') == 'bdist_wheel':
                 wheel_tags = set(parse_wheel_tags(file_info['filename']))
                 if not wheel_tags.isdisjoint(compatible_tags_set):
-                    # --- FIX ---
-                    # Return the specific version string, not the unreliable deps list
                     return file_info['url'], file_info['filename'], version
 
-    return None, None, None # Return three values to match success case
+    return None, None, None
 
-# --- NEW FUNCTION ---
 def get_dependencies_for_version(package_name, version):
-    """
-    Fetches the dependency list for a specific package version.
-    """
     url = f"https://pypi.org/pypi/{package_name}/{version}/json"
     try:
         print(f"   ℹ️ Fetching dependencies for {package_name} version {version}...")
@@ -109,8 +100,6 @@ def download_and_install(package_name):
     packages_in_progress.add(normalized_package_name)
 
     print(f"\n🔍 Searching for a compatible wheel for: {package_name}")
-    # --- FIX ---
-    # get_best_wheel now returns url, file_name, and version
     url, file_name, version = get_best_wheel(package_name)
 
     if url and file_name and version:
@@ -118,8 +107,6 @@ def download_and_install(package_name):
         print(f"   - Version: {version}")
         print(f"   - Filename: {file_name}")
 
-        # --- FIX ---
-        # Make a second API call to get the reliable dependency list
         dependencies = get_dependencies_for_version(package_name, version)
 
         env = default_environment()
@@ -131,27 +118,55 @@ def download_and_install(package_name):
                     if req.marker and not req.marker.evaluate(environment=env):
                         print(f"   ⏩ Skipping conditional dependency: {dep_string}")
                         continue
-
                     download_and_install(req.name)
-
                 except Exception as e:
                     print(f"⚠️ Could not parse dependency '{dep_string}': {e}. Skipping.")
         else:
             print("📄 No dependencies listed for this wheel.")
 
-
         print(f"\n⬇️ Downloading {file_name}...")
         try:
-            dl = Pypdl()
-            dl.start(url)
+            if not is_aria2_running():
+                print("❌ aria2c RPC server is not running. Start it with:")
+                print("   aria2c --enable-rpc --rpc-listen-all")
+                sys.exit(1)
+
+            import aria2p
+            aria2 = aria2p.API(
+                aria2p.Client(host="http://localhost", port=6800, secret="")
+            )
+
+            download = aria2.add_uris([url], options={
+                "max-connection-per-server": "16",
+                "split": "16",
+                "min-split-size": "1M",
+                "enable-http-pipelining": "true",
+                "user-agent": "Mozilla/5.0",
+                "continue": "true",
+                "out": file_name,
+                "dir": os.getcwd()
+            })
+
+            while True:
+                download.update()
+                if download.is_complete:
+                    print(f"   ✅ Download complete: {file_name}")
+                    break
+                elif download.is_removed or download.has_failed:
+                    print("   ❌ Download failed or removed.")
+                    sys.exit(1)
+                print(f"   ⏳ Downloading: {download.progress_string()} at {download.download_speed_string()}")
+                time.sleep(1)
+
         except Exception as e:
-            print(f"\n❌ Download failed: {e}")
+            print(f"\n❌ aria2p download failed: {e}")
             sys.exit(1)
 
         print(f"\n🚀 Installing {file_name}...")
         try:
-            command = f'"{sys.executable}" -m pip install --no-deps "{file_name}"'
-            print(f"   📟 Executing: {command}")
+            wheel_path = os.path.join(download.dir, download.name)
+            command = f'"{sys.executable}" -m pip install --no-deps "{wheel_path}"'
+            print(f"   📿 Executing: {command}")
             result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
             print(result.stdout)
             print(f"✅ Successfully installed {package_name}.")
@@ -162,13 +177,12 @@ def download_and_install(package_name):
             print(f"   - Stderr: {e.stderr}")
             sys.exit(1)
         finally:
-            if os.path.exists(file_name):
-                print(f"🧹 Cleaning up: {file_name}")
-                os.remove(file_name)
+            if os.path.exists(wheel_path):
+                print(f"🩹 Cleaning up: {wheel_path}")
+                os.remove(wheel_path)
 
     else:
         print(f"❌ No compatible wheel found for '{package_name}' on your system.")
-
 
 def cli():
     if len(sys.argv) == 1 or sys.argv[1] == '--help':
@@ -178,10 +192,6 @@ def cli():
     command = sys.argv[1]
 
     if command == 'list':
-        if len(sys.argv) != 2:
-            print("Usage: zipp list")
-            sys.exit(1)
-
         installed = installed_list()
         if not installed:
             print("No packages installed or could not read list.")
@@ -197,12 +207,10 @@ def cli():
             print("Usage: zipp install <package-name> [package-name...]")
             sys.exit(1)
 
-        packages_to_install = sys.argv[2:]
-        for pkg in packages_to_install:
+        for pkg in sys.argv[2:]:
             download_and_install(pkg)
 
         print("\nAll installations complete.")
-
 
 if __name__ == '__main__':
     cli()
