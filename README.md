@@ -15,5 +15,5 @@ It handles dependency resolution and finds the right wheels for your system, so 
 pip install zipip
 
 ## Usage
-
-In your commands, just replace pip with zipip :p
+Run : `aria2c --enable-rpc --rpc-listen-all ` and 
+in your commands, just replace pip with zipip :p
