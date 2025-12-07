@@ -4,6 +4,7 @@ import requests
 import subprocess
 import time
 import socket
+import aria2p
 from packaging import tags
 from packaging.version import parse as parse_version
 from packaging.tags import Tag
@@ -13,7 +14,7 @@ from importlib.metadata import distributions
 
 def is_aria2_running():
     try:
-        with socket.create_connection(("localhost", 6800), timeout=2):
+        with socket.create_connection(("localhost", 6800), timeout=1):
             return True
     except:
         return False
@@ -21,7 +22,8 @@ def is_aria2_running():
 def installed_list():
     installed = {}
     for dist in distributions():
-        installed[dist.metadata['Name'].lower()] = dist.version
+        normalized_name = dist.metadata['Name'].lower().replace('_', '-')
+        installed[normalized_name] = dist.version
     return installed
 
 def get_compatible_tags():
@@ -33,6 +35,7 @@ def parse_wheel_tags(filename):
     parts = filename.split('-')
     if len(parts) < 4:
         return []
+
     python_tag, abi_tag, platform_tag = parts[-3:]
     pythons = python_tag.split('.')
     abis = abi_tag.split('.')
@@ -55,7 +58,18 @@ def get_best_wheel(package_name):
 
     compatible_tags_set = get_compatible_tags()
 
-    stable_versions = [v for v in releases.keys() if not parse_version(v).is_prerelease]
+    stable_versions = []
+    for v in releases.keys():
+        try:
+            version_obj = parse_version(v)
+            if not version_obj.is_prerelease:
+                stable_versions.append(v)
+        except Exception as e:
+            if 'Invalid version' in str(e):
+                print(f"    Skipping invalid version string '{v}' for {package_name}.")
+            else:
+                raise e
+
     sorted_versions = sorted(stable_versions, key=parse_version, reverse=True)
 
     for version in sorted_versions:
@@ -71,14 +85,14 @@ def get_best_wheel(package_name):
 def get_dependencies_for_version(package_name, version):
     url = f"https://pypi.org/pypi/{package_name}/{version}/json"
     try:
-        print(f"   ℹ️ Fetching dependencies for {package_name} version {version}...")
+        print(f"    Fetching dependencies for {package_name} version {version}...")
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
         dependencies = data.get('info', {}).get('requires_dist', []) or []
         return dependencies
     except requests.RequestException as e:
-        print(f"   ⚠️ Could not fetch dependencies for {package_name}=={version}. {e}")
+        print(f"    Could not fetch dependencies for {package_name}=={version}. {e}")
         return []
 
 packages_in_progress = set()
@@ -90,53 +104,56 @@ def download_and_install(package_name):
 
     installed_packages = installed_list()
     if normalized_package_name in installed_packages:
-        print(f"✔️ {package_name} is already installed. Skipping.")
+        print(f"{package_name} is already installed (v{installed_packages[normalized_package_name]}). Skipping.")
         return
 
     if normalized_package_name in packages_in_progress:
-        print(f"☑️ {package_name} is already in the installation queue. Skipping.")
+        print(f"{package_name} is already in the installation queue. Skipping.")
         return
 
     packages_in_progress.add(normalized_package_name)
 
-    print(f"\n🔍 Searching for a compatible wheel for: {package_name}")
+    print(f"\nSearching for a compatible wheel for: {package_name}")
     url, file_name, version = get_best_wheel(package_name)
 
     if url and file_name and version:
-        print("✅ Found compatible wheel.")
-        print(f"   - Version: {version}")
-        print(f"   - Filename: {file_name}")
+        print("Found compatible wheel.")
+        print(f"    - Version: {version}")
+        print(f"    - Filename: {file_name}")
 
         dependencies = get_dependencies_for_version(package_name, version)
 
         env = default_environment()
         if dependencies:
-            print("📄 Checking dependencies...")
+            print("Checking and installing dependencies...")
             for dep_string in dependencies:
                 try:
                     req = Requirement(dep_string)
                     if req.marker and not req.marker.evaluate(environment=env):
-                        print(f"   ⏩ Skipping conditional dependency: {dep_string}")
+                        print(f"    Skipping conditional dependency: {dep_string}")
                         continue
-                    download_and_install(req.name)
-                except Exception as e:
-                    print(f"⚠️ Could not parse dependency '{dep_string}': {e}. Skipping.")
-        else:
-            print("📄 No dependencies listed for this wheel.")
 
-        print(f"\n⬇️ Downloading {file_name}...")
+                    dependency_name = req.name.lower().replace("_", "-")
+                    download_and_install(dependency_name)
+
+                except Exception as e:
+                    print(f"Could not parse dependency '{dep_string}': {e}. Skipping.")
+        else:
+            print("No dependencies listed for this wheel.")
+
+        print(f"\nDownloading {file_name}...")
+        download = None
         try:
             if not is_aria2_running():
-                print("❌ aria2c RPC server is not running. Start it with:")
-                print("   aria2c --enable-rpc --rpc-listen-all")
+                print("aria2c RPC server is not running. Start it with:")
+                print("    aria2c --enable-rpc --rpc-listen-all")
                 sys.exit(1)
 
-            import aria2p
             aria2 = aria2p.API(
                 aria2p.Client(host="http://localhost", port=6800, secret="")
             )
 
-            download = aria2.add_uris([url], options={
+            options = {
                 "max-connection-per-server": "16",
                 "split": "16",
                 "min-split-size": "1M",
@@ -145,48 +162,65 @@ def download_and_install(package_name):
                 "continue": "true",
                 "out": file_name,
                 "dir": os.getcwd()
-            })
+            }
+
+            download = aria2.add_uris([url], options=options)
 
             while True:
                 download.update()
                 if download.is_complete:
-                    print(f"   ✅ Download complete: {file_name}")
+                    print(f"    Download complete: {file_name}")
                     break
                 elif download.is_removed or download.has_failed:
-                    print("   ❌ Download failed or removed.")
+                    print(f"    Download failed or removed (Status: {download.status}).")
                     sys.exit(1)
-                print(f"   ⏳ Downloading: {download.progress_string()} at {download.download_speed_string()}")
+
+                if download.total_length and download.download_speed:
+                    print(f"    Downloading: {download.progress_string()} at {download.download_speed_string()}")
+                else:
+                    print("    Downloading...")
                 time.sleep(1)
 
+        except aria2p.client.ClientException as e:
+            print(f"\naria2c RPC client error: {e}")
+            sys.exit(1)
         except Exception as e:
-            print(f"\n❌ aria2p download failed: {e}")
+            print(f"\naria2p download failed: {e}")
             sys.exit(1)
 
-        print(f"\n🚀 Installing {file_name}...")
+        print(f"\nInstalling {file_name}...")
+        wheel_path = os.path.join(download.dir, download.name) if download else None
+
         try:
-            wheel_path = os.path.join(download.dir, download.name)
-            command = f'"{sys.executable}" -m pip install --no-deps "{wheel_path}"'
-            print(f"   📿 Executing: {command}")
-            result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
-            print(result.stdout)
-            print(f"✅ Successfully installed {package_name}.")
+            if wheel_path:
+                command = f'"{sys.executable}" -m pip install --no-deps "{wheel_path}"'
+                print(f"    Executing: {command}")
+                result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+                print(result.stdout)
+                print(f"Successfully installed {package_name}=={version}.")
+            else:
+                print(f"Installation skipped: Download object or path missing.")
 
         except subprocess.CalledProcessError as e:
-            print(f"\n❌ Pip failed to install '{package_name}'.")
-            print(f"   - Exit Code: {e.returncode}")
-            print(f"   - Stderr: {e.stderr}")
+            print(f"\nPip failed to install '{package_name}'.")
+            print(f"    - Exit Code: {e.returncode}")
+            print(f"    - Stderr: {e.stderr}")
             sys.exit(1)
+
         finally:
-            if os.path.exists(wheel_path):
-                print(f"🩹 Cleaning up: {wheel_path}")
+            if wheel_path and os.path.exists(wheel_path):
+                print(f"Cleaning up: {wheel_path}")
                 os.remove(wheel_path)
 
     else:
-        print(f"❌ No compatible wheel found for '{package_name}' on your system.")
+        print(f"No compatible wheel found for '{package_name}' on your system.")
 
 def cli():
     if len(sys.argv) == 1 or sys.argv[1] == '--help':
-        print("Usage:\n  zipp [--help]\n  zipp list\n  zipp install <package-name> [package-name...]")
+        print("Usage:")
+        print("  zipip [--help]")
+        print("  zipip list")
+        print("  zipip install <package-name> [package-name...]")
         sys.exit(0)
 
     command = sys.argv[1]
@@ -204,11 +238,12 @@ def cli():
     elif command == 'install':
         if len(sys.argv) < 3:
             print("Error: 'install' command requires at least one package name.")
-            print("Usage: zipp install <package-name> [package-name...]")
+            print("Usage: zipip install <package-name> [package-name...]")
             sys.exit(1)
 
         for pkg in sys.argv[2:]:
-            download_and_install(pkg)
+            normalized_pkg = pkg.lower().replace("_", "-")
+            download_and_install(normalized_pkg)
 
         print("\nAll installations complete.")
 
